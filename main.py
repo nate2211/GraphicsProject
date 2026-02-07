@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
 import subprocess # For ffmpeg
@@ -12,11 +13,13 @@ import numpy as np
 from PIL import Image
 import shutil
 import subprocess, sys, threading, time
+import animations
 import designs
 import detail
 import warp
 import camera
-import animations
+import visualizer
+
 # Make sure graphics.py and animations.py are importable
 try:
     from graphics import GraphicsEngine as GraphicsEngineBase, parse_extras, REGISTRY as GFX_REGISTRY, BaseBlock as GfxBaseBlock
@@ -27,6 +30,24 @@ except ImportError as e:
     print(f"Details: {e}")
     sys.exit(1)
 
+def _call_block_process(block, img, width, height, params, ctx):
+    """
+    Call block.process() safely:
+      - If the block accepts `ctx`, pass it.
+      - Otherwise call without `ctx`.
+    """
+    try:
+        sig = inspect.signature(block.process)
+        if "ctx" in sig.parameters:
+            return block.process(img, width, height, params=params, ctx=ctx)
+        else:
+            return block.process(img, width, height, params=params)
+    except TypeError as e:
+        # Fallback: if signature inspection lies (wrappers), retry without ctx
+        msg = str(e).lower()
+        if "unexpected keyword argument" in msg and "ctx" in msg:
+            return block.process(img, width, height, params=params)
+        raise
 # ----- Modified Graphics Engine -----
 class GraphicsEngine(GraphicsEngineBase):
     """Extended engine to handle animation context and block types."""
@@ -34,53 +55,74 @@ class GraphicsEngine(GraphicsEngineBase):
     def render_frame(
         self,
         *,
-        pipeline: List[str], # Use pre-parsed list
-        extras: List[Dict[str, Any]], # Use pre-split extras
+        pipeline: List[str],
+        extras: List[Dict[str, Any]],
         ctx: AnimationContext,
     ) -> Image.Image:
-        """Renders a single frame for animation."""
         img: Optional[Image.Image] = None
 
+        # -------- PASS 1: collect animation overrides for target stages ----------
+        stage_overrides: dict[int, dict[str, Any]] = {}
+
+        # helper: find which stage index an animation targets
+        def _find_target_stage_index(target_block: str) -> Optional[int]:
+            tb = (target_block or "").strip().lower()
+            if not tb:
+                return None
+            # FIRST occurrence in pipeline (you can change this to "last", or support target_stage param)
+            for j, nm in enumerate(pipeline):
+                if (nm or "").strip().lower() == tb and tb in GFX_REGISTRY.names():
+                    return j
+            return None
+
         for i, name in enumerate(pipeline):
-            params = extras[i]
-            # Check if it's an animation block first
-            if name in ANIMATION_REGISTRY.names():
-                block = ANIMATION_REGISTRY.create(name)
-                if isinstance(block, BaseAnimationBlock):
-                    img = block.process_frame(img, ctx, params, self) # Pass engine ref
-                else:
-                     print(f"Warning: Block '{name}' in animation registry but not a BaseAnimationBlock.", file=sys.stderr)
-                     # Attempt to process as graphics block if possible (might fail)
-                     try:
-                         gfx_block = GFX_REGISTRY.create(name)
-                         img = gfx_block.process(img, ctx.width, ctx.height, params=params)
-                     except Exception as e_inner:
-                          print(f"Error trying gfx fallback for '{name}': {e_inner}", file=sys.stderr)
-                          # Keep previous image state if error occurs
-            # Otherwise, assume it's a graphics block
-            elif name in GFX_REGISTRY.names():
-                block = GFX_REGISTRY.create(name)
-                img = block.process(img, ctx.width, ctx.height, params=params)
+            nm = (name or "").strip().lower()
+            if nm in ANIMATION_REGISTRY.names():
+                anim = ANIMATION_REGISTRY.create(nm)
+                params = extras[i]
+
+                # New: animation blocks may expose get_overrides()
+                if hasattr(anim, "get_overrides") and callable(getattr(anim, "get_overrides")):
+                    try:
+                        target_block, overrides = anim.get_overrides(ctx, params, self)
+                        j = _find_target_stage_index(target_block)
+                        if j is not None and overrides:
+                            stage_overrides.setdefault(j, {}).update(overrides)
+                    except Exception as e:
+                        print(f"[Engine] override gather failed for '{nm}': {e}", file=sys.stderr)
+
+        # -------- PASS 2: render only graphics stages (animation stages are skipped) ----------
+        for i, name in enumerate(pipeline):
+            nm = (name or "").strip().lower()
+
+            # Skip animation blocks entirely (they are controllers only now)
+            if nm in ANIMATION_REGISTRY.names():
+                continue
+
+            if nm in GFX_REGISTRY.names():
+                params = dict(extras[i] or {})
+
+                # Apply any overrides gathered for THIS stage index
+                if i in stage_overrides:
+                    params.update(stage_overrides[i])
+
+                block = GFX_REGISTRY.create(nm)
+                img = _call_block_process(block, img, ctx.width, ctx.height, params, ctx)
+
             else:
-                # Should not happen if validation is done beforehand
-                raise KeyError(f"Unknown block type '{name}' in pipeline.")
+                raise KeyError(f"Unknown block type '{nm}' in pipeline.")
 
             if img is None:
-                raise RuntimeError(f"Block '{name}' returned None during frame {ctx.frame}")
+                raise RuntimeError(f"Block '{nm}' returned None during frame {ctx.frame}")
 
-            # Ensure consistent mode and size after each block
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
             if img.size != (ctx.width, ctx.height):
-                 print(f"Warning: Block '{name}' changed size on frame {ctx.frame}, resizing.", file=sys.stderr)
-                 img = img.resize((ctx.width, ctx.height), Image.Resampling.LANCZOS)
+                img = img.resize((ctx.width, ctx.height), Image.Resampling.LANCZOS)
 
-        # Fallback if pipeline yields None (e.g., empty pipeline)
         if img is None:
-            img = Image.new("RGBA", (ctx.width, ctx.height), (255, 0, 255, 255)) # Magenta error
-
+            img = Image.new("RGBA", (ctx.width, ctx.height), (255, 0, 255, 255))
         return img
-
 # ----------------------------- FFMPEG Video Output -----------------------------
 
 def _drain_stream(stream):
@@ -91,38 +133,104 @@ def _drain_stream(stream):
     except Exception:
         pass
 
-def start_ffmpeg_process(outfile: str, width: int, height: int, fps: float, ffmpeg_bin: str | None = None) -> subprocess.Popen:
-    bin_path = ffmpeg_bin or os.environ.get("FFMPEG_BIN") or "ffmpeg"
+
+def _which_ffmpeg() -> str:
+    # If running as a PyInstaller bundle, use the internal temporary path
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+
+    # Fallback for when you are just running it in PyCharm
+    return r"C:\Users\natem\PycharmProjects\graphicsProject\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"
+def start_ffmpeg_process(
+    outfile: str,
+    width: int,
+    height: int,
+    fps: float,
+    audio_path: str | None = None,
+    ffmpeg_bin: str | None = None,
+    duration: float | None = None,      # optional: clamp to your animation length
+    loop_audio: bool = True,           # optional: loop audio to fill duration
+) -> subprocess.Popen:
+    bin_path = _which_ffmpeg()
+
     command = [
         bin_path,
         "-y",
-        "-loglevel", "error",     # reduce stderr noise
+        "-loglevel", "error",
         "-hide_banner",
         "-nostats",
+    ]
+
+    # ----- VIDEO INPUT (raw RGBA frames from stdin) -----
+    command += [
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgba",
         "-s", f"{width}x{height}",
         "-r", str(fps),
-        "-i", "-",
+        "-i", "-",  # stdin
+    ]
+
+    has_audio = bool(audio_path)
+
+    # ----- AUDIO INPUT (optional) -----
+    if has_audio:
+        if loop_audio:
+            command += ["-stream_loop", "-1", "-i", audio_path]
+        else:
+            command += ["-i", audio_path]
+        command += [
+            "-i", audio_path,
+        ]
+
+        # Explicit mapping: video from input 0, audio from input 1
+        command += [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+        ]
+
+        # If you know the animation duration, clamp output length.
+        # (Helps if audio is longer / looped.)
+        if duration is not None and duration > 0:
+            command += ["-t", str(float(duration))]
+
+    else:
+        # No audio: you may still want to clamp duration if provided
+        if duration is not None and duration > 0:
+            command += ["-t", str(float(duration))]
+
+    # ----- OUTPUT ENCODE SETTINGS -----
+    command += [
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "20",
         "-pix_fmt", "yuv420p",
+    ]
+
+    if has_audio:
+        command += [
+            "-c:a", "aac",
+            "-b:a", "192k",
+        ]
+        # If you want the export to stop when the *shorter* stream ends, enable this:
+        # command += ["-shortest"]
+
+    command += [
+        "-movflags", "+faststart",
         outfile,
     ]
+
     print("Starting ffmpeg:", " ".join(command), "->", outfile, file=sys.stderr)
+
     try:
-        # On Windows, avoid creating a console window (optional)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,           # keep PIPE but drain it in a thread
+            stderr=subprocess.PIPE,
             creationflags=creationflags
         )
-        # Drain stderr to prevent deadlock
         threading.Thread(target=_drain_stream, args=(proc.stderr,), daemon=True).start()
         return proc
     except FileNotFoundError:

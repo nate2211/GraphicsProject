@@ -1,13 +1,4 @@
-# camera_advanced_v3_5.py — CameraPipeline v3.5 (cinema‑grade, animation‑aware, look/move rig)
-# -----------------------------------------------------------------------------------
-# New in v3.5 (drop‑in, backwards compatible):
-# - Camera "rig" that can LOOK and MOVE around the scene with intuitive film terms
-# - Modes: direct (legacy), target (look‑at), orbit, and path (waypoints)
-# - Controls: look_yaw_deg (alias rotation), look_tilt_{x,y} (alias tilt), dolly, truck_x/y
-# - Targeting on canvas or detected content bbox; composition pivot alignment retained
-# - Simple path follower with normalized (0..1) points; clamp/loop/pingpong play modes
-# - Orbit around a point (normalized) with optional face_target behavior
-# - Dolly scales zoom; truck shifts camera after auto-fit and clamping
+# camera_advanced_v3_5.py — CameraPipeline v3.5 (cinema-grade, animation-aware, look/move rig)
 # -----------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -19,9 +10,7 @@ from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 from PIL import Image, ImageFilter
 
-# Graphics glue
-from graphics import BaseBlock, REGISTRY, _ensure_image, _parse_color
-# Animation glue (safe to import; your repo provides these)
+from graphics import BaseBlock, REGISTRY, _ensure_image, _parse_color, help, params
 from animations import ANIMATION_REGISTRY, AnimationContext
 
 # =============================================================================
@@ -33,7 +22,7 @@ def _norm01(x: float) -> float:
 
 
 def _clamp(x: float, a: float, b: float) -> float:
-    return max(a, min(b, x))
+    return max(a, min(b, float(x)))
 
 
 def _rng(seed: Optional[int]) -> random.Random:
@@ -72,7 +61,8 @@ def _dilate_bbox(b: Tuple[int, int, int, int], pad_px: int, W: int, H: int) -> T
         min(H, y1 + pad_px),
     )
 
-# ------------------------ Animation‑aware sub‑pipeline ------------------------
+
+# ------------------------ Animation-aware sub-pipeline ------------------------
 
 def _collect_prefixed(extras: Dict[str, Any], prefix: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -120,13 +110,13 @@ def _run_sub_pipeline(pipeline: str, width: int, height: int, extras: Dict[str, 
     ctx = _anim_ctx_from(anim_info, width, height)
 
     for idx1, raw in enumerate(names, start=1):
-        params = _sub_params_for(extras, raw, idx1)
+        p = _sub_params_for(extras, raw, idx1)
         if raw in ANIMATION_REGISTRY.names():
             anim_blk = ANIMATION_REGISTRY.create(raw)  # type: ignore
-            img = anim_blk.process_frame(img, ctx, params, engine=None)
+            img = anim_blk.process_frame(img, ctx, p, engine=None)
         else:
             blk = REGISTRY.create(raw)
-            img = blk.process(img, width, height, params=params)
+            img = blk.process(img, width, height, params=p)
         if img is None:
             raise RuntimeError(f"Sub-pipeline block '{raw}' returned None")
         if img.mode != "RGBA":
@@ -134,6 +124,7 @@ def _run_sub_pipeline(pipeline: str, width: int, height: int, extras: Dict[str, 
         if img.size != (width, height):
             img = img.resize((width, height), Image.Resampling.LANCZOS)
     return _ensure_image(img, width, height)
+
 
 # ------------------------------ Backgrounds ------------------------------
 
@@ -160,6 +151,7 @@ def _make_background(width: int, height: int, kind: str,
         arr = (c0a * (1 - r) + c1a * r).astype(np.uint8)
         return Image.fromarray(arr, "RGBA")
     return Image.new("RGBA", (width, height), c0)
+
 
 # ------------------------------ Lens & Post ------------------------------
 
@@ -218,16 +210,19 @@ def _lens_distort(img: Image.Image, k1: float, k2: float, center: Tuple[float, f
     factor = 1 + k1 * r2 + k2 * r2 * r2
     u = cx + x * factor * smax
     v = cy + y * factor * smax
+
     x0 = np.floor(u).astype(np.int32)
     y0 = np.floor(v).astype(np.int32)
     x1 = np.clip(x0 + 1, 0, w - 1)
     y1 = np.clip(y0 + 1, 0, h - 1)
     x0 = np.clip(x0, 0, w - 1)
     y0 = np.clip(y0, 0, h - 1)
+
     wa = (x1 - u) * (y1 - v)
     wb = (u - x0) * (y1 - v)
     wc = (x1 - u) * (v - y0)
     wd = (u - x0) * (v - y0)
+
     out = (
         arr[y0, x0] * wa[..., None] +
         arr[y0, x1] * wb[..., None] +
@@ -368,6 +363,7 @@ def _letterbox(img: Image.Image, aspect: float, bg: Tuple[int, int, int, int]) -
         canvas.paste(img, (x, 0))
         return canvas
 
+
 # ------------------------------ Rig helpers ------------------------------
 
 def _parse_points(s: str) -> List[Tuple[float, float]]:
@@ -401,7 +397,6 @@ def _polyline_eval(points: List[Tuple[float, float]], t: float, mode: str) -> Tu
     if n == 1:
         return points[0]
     mode_l = (mode or "clamp").lower()
-    # Build segment count and handle looping
     if mode_l == "loop":
         total_segs = n
         t = t % 1.0
@@ -409,57 +404,152 @@ def _polyline_eval(points: List[Tuple[float, float]], t: float, mode: str) -> Tu
         i0 = int(math.floor(seg_f)) % n
         i1 = (i0 + 1) % n
         lt = seg_f - math.floor(seg_f)
-        x = _lerp(points[i0][0], points[i1][0], lt)
-        y = _lerp(points[i0][1], points[i1][1], lt)
-        return x, y
+        return (
+            _lerp(points[i0][0], points[i1][0], lt),
+            _lerp(points[i0][1], points[i1][1], lt),
+        )
     if mode_l == "pingpong":
         t2 = t % 2.0
         if t2 > 1.0:
             t2 = 2.0 - t2
         t = t2
-    # clamp (or pingpong after folding) on n-1 segments
     total_segs = max(1, n - 1)
     seg_f = _clamp(t, 0.0, 1.0) * total_segs
     i0 = int(math.floor(seg_f))
     i1 = min(i0 + 1, n - 1)
     lt = seg_f - math.floor(seg_f)
-    x = _lerp(points[i0][0], points[i1][0], lt)
-    y = _lerp(points[i0][1], points[i1][1], lt)
-    return x, y
+    return (
+        _lerp(points[i0][0], points[i1][0], lt),
+        _lerp(points[i0][1], points[i1][1], lt),
+    )
+
 
 # =============================================================================
-# Camera block (with look/move rig)
+# Camera block (with look/move rig) — rewritten with help/params
 # =============================================================================
+
+@help(
+    "Cinematic camera transform + post stack (v3.5). Backwards compatible.\n"
+    "Supports camera rig modes (direct/target/orbit/path), auto-fit on content, lens/post effects, "
+    "and optional pre/design/post sub-pipelines."
+)
+@params({
+    # ---------- Pipelines ----------
+    "pre_pipeline":         {"type": "str", "default": "", "multiline": False},
+    "design_pipeline":      {"type": "str", "default": "", "multiline": False},
+    "post_pipeline":        {"type": "str", "default": "", "multiline": False},
+
+    # ---------- Background ----------
+    "background_kind":      {"type": "enum", "default": "solid", "choices": ["solid", "vgrad", "rgrad"]},
+    "background_color0":    {"type": "color", "default": "#00000000"},
+    "background_color1":    {"type": "color", "default": "#00000000"},
+
+    # ---------- Legacy camera ----------
+    "pan_x":                {"type": "float", "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01},
+    "pan_y":                {"type": "float", "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01},
+    "zoom":                 {"type": "float", "default": 1.0, "min": 0.01, "max": 20.0, "step": 0.01},
+    "rotation":             {"type": "float", "default": 0.0, "min": -360.0, "max": 360.0, "step": 0.5},
+
+    # ---------- Auto-fit / tracking ----------
+    "auto_fit":             {"type": "bool", "default": True},
+    "fit_mode":             {"type": "enum", "default": "contain", "choices": ["contain", "cover", "fill"]},
+    "auto_fit_padding":     {"type": "float", "default": 0.08, "min": 0.0, "max": 0.45, "step": 0.01},
+    "track_alpha_thresh":   {"type": "int", "default": 2, "min": 0, "max": 255, "step": 1},
+    "track_brightness_thresh": {"type": "float", "default": 0.02, "min": 0.0, "max": 1.0, "step": 0.005},
+    "bbox_pad_px":          {"type": "int", "default": 4, "min": 0, "max": 4096, "step": 1},
+
+    # ---------- Clamp / composition ----------
+    "clamp_pan":            {"type": "bool", "default": True},
+    "safe_margin":          {"type": "float", "default": 0.05, "min": 0.0, "max": 0.4, "step": 0.01},
+    "composition_pivot_x":  {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "composition_pivot_y":  {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+
+    # ---------- Look (tilt / focal) ----------
+    "tilt_x":               {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+    "tilt_y":               {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+    "focal_len":            {"type": "float", "default": 1.0, "min": 0.2, "max": 10.0, "step": 0.01},
+
+    # Aliases
+    "look_yaw_deg":         {"type": "float", "default": 0.0, "min": -360.0, "max": 360.0, "step": 0.5},
+    "look_tilt_x":          {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+    "look_tilt_y":          {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+
+    # ---------- Rig mode ----------
+    "cam_mode":             {"type": "enum", "default": "direct", "choices": ["direct", "target", "orbit", "path"]},
+
+    # target mode
+    "cam_target_x":         {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "cam_target_y":         {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "cam_target_space":     {"type": "enum", "default": "canvas", "choices": ["canvas", "content"]},
+    "face_target":          {"type": "bool", "default": False},
+
+    # orbit mode
+    "orbit_center_x":       {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "orbit_center_y":       {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "orbit_radius_px":      {"type": "float", "default": 0.0, "min": 0.0, "max": 200000.0, "step": 1.0},
+    "orbit_angle_deg":      {"type": "float", "default": 0.0, "min": -36000.0, "max": 36000.0, "step": 1.0},
+    "orbit_face_target":    {"type": "bool", "default": True},
+
+    # path mode
+    "path_points":          {"type": "str", "default": "", "hint": "x,y; x,y; ... (normalized 0..1)"},
+    "path_t":               {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001},
+    "path_mode":            {"type": "enum", "default": "clamp", "choices": ["clamp", "loop", "pingpong"]},
+
+    # common movement
+    "truck_x_px":           {"type": "float", "default": 0.0, "min": -200000.0, "max": 200000.0, "step": 1.0},
+    "truck_y_px":           {"type": "float", "default": 0.0, "min": -200000.0, "max": 200000.0, "step": 1.0},
+    "dolly":                {"type": "float", "default": 0.0, "min": -10.0, "max": 10.0, "step": 0.01},
+
+    # shake
+    "shake_strength":       {"type": "float", "default": 0.0, "min": 0.0, "max": 10000.0, "step": 0.1},
+    "shake_seed":           {"type": "int", "default": None, "nullable": True},
+
+    # ---------- Lens ----------
+    "lens_k1":              {"type": "float", "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.001},
+    "lens_k2":              {"type": "float", "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.001},
+
+    # ---------- Post optics ----------
+    "vignette":             {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+    "chroma_shift_px":      {"type": "float", "default": 0.0, "min": 0.0, "max": 200.0, "step": 0.1},
+    "chroma_shift_x_px":    {"type": "float", "default": 0.0, "min": -200.0, "max": 200.0, "step": 0.1},
+    "chroma_shift_y_px":    {"type": "float", "default": 0.0, "min": -200.0, "max": 200.0, "step": 0.1},
+
+    "bloom_threshold":      {"type": "float", "default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01},
+    "bloom_radius":         {"type": "float", "default": 8.0,  "min": 0.0, "max": 500.0, "step": 0.1},
+    "bloom_intensity":      {"type": "float", "default": 0.0,  "min": 0.0, "max": 10.0, "step": 0.01},
+
+    # tilt-shift
+    "tiltshift_center_y":   {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "tiltshift_band_h":     {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+    "tiltshift_blur_radius": {"type": "float", "default": 0.0, "min": 0.0, "max": 200.0, "step": 0.1},
+
+    # ---------- Grade ----------
+    "white_balance":        {"type": "str", "default": "1,1,1", "hint": "r,g,b multipliers"},
+    "exposure":             {"type": "float", "default": 0.0, "min": -10.0, "max": 10.0, "step": 0.01},
+    "contrast":             {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+    "lift":                 {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01},
+    "gamma":                {"type": "float", "default": 1.0, "min": 0.05, "max": 5.0, "step": 0.01},
+    "gain":                 {"type": "float", "default": 1.0, "min": 0.05, "max": 5.0, "step": 0.01},
+
+    # ---------- Film / artifacts ----------
+    "film_grain":           {"type": "float", "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.01},
+    "grain":                {"type": "float", "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.01},
+    "grain_seed":           {"type": "int", "default": None, "nullable": True},
+    "rolling_shutter":      {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.001},
+
+    # ---------- Aspect / framing ----------
+    "anamorphic_ratio":     {"type": "float", "default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01},
+    "letterbox_aspect":     {"type": "float", "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001},
+    "letterbox_color":      {"type": "color", "default": "#000000"},
+})
 @dataclass
 class CameraPipeline(BaseBlock):
     """
-    Cinematic view transform & post. **Backwards compatible** with v1/v2/v3.
-
-    New rig parameters (all optional):
-      cam_mode              : direct|target|orbit|path        [direct]
-      # target mode
-      cam_target_x/y        : float 0..1 (normalized)         [0.5, 0.5]
-      cam_target_space      : canvas|content                   [canvas]
-      face_target           : bool (rotate so target stays up) [False]
-      # orbit mode
-      orbit_center_x/y      : float 0..1                       [0.5, 0.5]
-      orbit_radius_px       : float px                         [0]
-      orbit_angle_deg       : float deg                        [0]
-      orbit_face_target     : bool                             [True]
-      # path mode
-      path_points           : "x,y; x,y; ..." (normalized)
-      path_t                : float 0..1                       [0]
-      path_mode             : clamp|loop|pingpong              [clamp]
-      # common movement
-      truck_x_px/y_px       : float px                         [0, 0]
-      dolly                 : float (zoom factor ~ 2**dolly)   [0]
-      # look controls (aliases to legacy)
-      look_yaw_deg          : float (alias rotation)
-      look_tilt_x, _y       : float -1..1 (aliases tilt_x/y)
+    Cinematic view transform & post. Backwards compatible.
     """
 
     def process(self, img, width, height, *, params):
-        W, H = width, height
+        W, H = int(width), int(height)
 
         # -------------------- Background --------------------
         bg_kind = str(params.get("background_kind", "solid"))
@@ -477,33 +567,40 @@ class CameraPipeline(BaseBlock):
         else:
             design = _ensure_image(img, W, H)
             if pre:
-                pre_extras = dict(sub_extras)
-                design = _run_sub_pipeline(pre, W, H, pre_extras)
+                design = _run_sub_pipeline(pre, W, H, dict(sub_extras))
         design = _to_rgba(design)
 
         # -------------------- Core camera params (legacy + aliases) --------------------
-        pan_x = float(params.get("pan_x", 0.0))
-        pan_y = float(params.get("pan_y", 0.0))
-        zoom = float(params.get("zoom", 1.0))
-        rotation = float(params.get("rotation", params.get("look_yaw_deg", 0.0)))
+        pan_x = float(params.get("pan_x", 0.0) or 0.0)
+        pan_y = float(params.get("pan_y", 0.0) or 0.0)
+        zoom = float(params.get("zoom", 1.0) or 1.0)
+
+        rotation = float(params.get("rotation", 0.0) or 0.0)
+        if "rotation" not in params and "look_yaw_deg" in params:
+            rotation = float(params.get("look_yaw_deg", 0.0) or 0.0)
+
+        tilt_x = float(params.get("tilt_x", 0.0) or 0.0)
+        tilt_y = float(params.get("tilt_y", 0.0) or 0.0)
+        if "tilt_x" not in params and "look_tilt_x" in params:
+            tilt_x = float(params.get("look_tilt_x", 0.0) or 0.0)
+        if "tilt_y" not in params and "look_tilt_y" in params:
+            tilt_y = float(params.get("look_tilt_y", 0.0) or 0.0)
 
         auto_fit = bool(params.get("auto_fit", True))
         fit_mode = str(params.get("fit_mode", "contain")).lower()
-        pad_frac = _clamp(float(params.get("auto_fit_padding", 0.08)), 0.0, 0.45)
-        athresh = int(params.get("track_alpha_thresh", 2))
-        bthresh = float(params.get("track_brightness_thresh", 0.02))
-        bbox_pad = max(0, int(params.get("bbox_pad_px", 4)))
+        pad_frac = _clamp(float(params.get("auto_fit_padding", 0.08) or 0.08), 0.0, 0.45)
+        athresh = int(params.get("track_alpha_thresh", 2) or 2)
+        bthresh = float(params.get("track_brightness_thresh", 0.02) or 0.02)
+        bbox_pad = max(0, int(params.get("bbox_pad_px", 4) or 4))
 
         clamp_pan = bool(params.get("clamp_pan", True))
-        safe_margin = _clamp(float(params.get("safe_margin", 0.05)), 0.0, 0.4)
-        comp_px = _clamp(float(params.get("composition_pivot_x", 0.5)), 0.0, 1.0)
-        comp_py = _clamp(float(params.get("composition_pivot_y", 0.5)), 0.0, 1.0)
+        safe_margin = _clamp(float(params.get("safe_margin", 0.05) or 0.05), 0.0, 0.4)
+        comp_px = _clamp(float(params.get("composition_pivot_x", 0.5) or 0.5), 0.0, 1.0)
+        comp_py = _clamp(float(params.get("composition_pivot_y", 0.5) or 0.5), 0.0, 1.0)
 
-        tilt_x = float(params.get("tilt_x", params.get("look_tilt_x", 0.0)))
-        tilt_y = float(params.get("tilt_y", params.get("look_tilt_y", 0.0)))
-        focal_len = max(0.2, float(params.get("focal_len", 1.0)))
+        focal_len = max(0.2, float(params.get("focal_len", 1.0) or 1.0))
 
-        # -------------------- Auto‑fit scale --------------------
+        # -------------------- Auto-fit scale --------------------
         eff_zoom = zoom
         bbox = _content_bbox_alpha(design, alpha_thresh=athresh) if auto_fit else None
         if auto_fit and not bbox:
@@ -524,7 +621,7 @@ class CameraPipeline(BaseBlock):
                     s_auto = (s_w + s_h) * 0.5
                 elif fit_mode == "cover":
                     s_auto = max(vW / bw, vH / bh)
-                else:  # contain
+                else:
                     s_auto = min(vW / bw, vH / bh)
                 eff_zoom = min(eff_zoom, s_auto)
             else:
@@ -554,78 +651,58 @@ class CameraPipeline(BaseBlock):
 
         # -------------------- RIG: look & move augmentations --------------------
         cam_mode = str(params.get("cam_mode", "direct")).lower()
-        truck_x = float(params.get("truck_x_px", 0.0))
-        truck_y = float(params.get("truck_y_px", 0.0))
-        dolly = float(params.get("dolly", 0.0))  # zoom *= 2**dolly later
+        truck_x = float(params.get("truck_x_px", 0.0) or 0.0)
+        truck_y = float(params.get("truck_y_px", 0.0) or 0.0)
+        dolly = float(params.get("dolly", 0.0) or 0.0)
 
-        # Target mode: look/move to put (cam_target_x,y) at screen center.
         if cam_mode == "target":
             tspace = str(params.get("cam_target_space", "canvas")).lower()
-            tx0, ty0 = tx, ty
             if tspace == "content" and bbox:
                 x0, y0, x1, y1 = bbox
                 bw = max(1, x1 - x0)
                 bh = max(1, y1 - y0)
-                gx = x0 + _norm01(float(params.get("cam_target_x", 0.5))) * bw
-                gy = y0 + _norm01(float(params.get("cam_target_y", 0.5))) * bh
+                gx = x0 + _norm01(float(params.get("cam_target_x", 0.5) or 0.5)) * bw
+                gy = y0 + _norm01(float(params.get("cam_target_y", 0.5) or 0.5)) * bh
             else:
-                gx = _norm01(float(params.get("cam_target_x", 0.5))) * W
-                gy = _norm01(float(params.get("cam_target_y", 0.5))) * H
-            sx = W * 0.5
-            sy = H * 0.5
-            # move so (gx,gy) aligns with screen center (sx,sy)
+                gx = _norm01(float(params.get("cam_target_x", 0.5) or 0.5)) * W
+                gy = _norm01(float(params.get("cam_target_y", 0.5) or 0.5)) * H
+            sx, sy = W * 0.5, H * 0.5
             tx += (sx - gx * eff_zoom)
             ty += (sy - gy * eff_zoom)
-            if bool(params.get("face_target", False)):
-                # keep rotation minimal in 2D; alias to existing rotation
-                rotation = rotation  # (placeholder — caller can animate look_yaw_deg)
+            # face_target kept as a semantic flag (rotation is user-driven)
 
-        # Orbit mode: circular trucking around a center; optional face target
         elif cam_mode == "orbit":
-            ocx = _norm01(float(params.get("orbit_center_x", 0.5))) * W
-            ocy = _norm01(float(params.get("orbit_center_y", 0.5))) * H
-            radius = float(params.get("orbit_radius_px", 0.0))
-            angle = math.radians(float(params.get("orbit_angle_deg", 0.0)))
+            ocx = _norm01(float(params.get("orbit_center_x", 0.5) or 0.5)) * W
+            ocy = _norm01(float(params.get("orbit_center_y", 0.5) or 0.5)) * H
+            radius = float(params.get("orbit_radius_px", 0.0) or 0.0)
+            angle = math.radians(float(params.get("orbit_angle_deg", 0.0) or 0.0))
             tx += radius * math.cos(angle)
             ty += radius * math.sin(angle)
-            if bool(params.get("orbit_face_target", True)):
-                # Subtle parallax cue — rotate a touch as we orbit
-                rotation += math.degrees(0.0)  # no forced spin; user animates look_yaw_deg if desired
-            # Recenter on orbit center (so we actually "look at" it)
-            sx = W * 0.5
-            sy = H * 0.5
+            sx, sy = W * 0.5, H * 0.5
             tx += (sx - ocx * eff_zoom)
             ty += (sy - ocy * eff_zoom)
 
-        # Path mode: follow normalized waypoints; t comes from path_t or __anim.time/duration
         elif cam_mode == "path":
-            pts = _parse_points(str(params.get("path_points", "")).strip())
+            pts = _parse_points(str(params.get("path_points", "") or "").strip())
             mode = str(params.get("path_mode", "clamp"))
-            # derive t if not provided
             if "path_t" in params:
-                t = _norm01(float(params.get("path_t", 0.0)))
+                t = _norm01(float(params.get("path_t", 0.0) or 0.0))
             else:
-                anim = params.get("__anim", {})
+                anim = params.get("__anim", {}) if isinstance(params.get("__anim", {}), dict) else {}
                 dur = float(anim.get("duration", 1.0))
-                t = 0.0
-                if dur > 1e-6:
-                    t = (float(anim.get("time", 0.0)) / dur)
+                t = 0.0 if dur <= 1e-6 else (float(anim.get("time", 0.0)) / dur)
             px, py = _polyline_eval(pts, t, mode)
-            gx = px * W
-            gy = py * H
-            sx = W * 0.5
-            sy = H * 0.5
+            gx, gy = px * W, py * H
+            sx, sy = W * 0.5, H * 0.5
             tx += (sx - gx * eff_zoom)
             ty += (sy - gy * eff_zoom)
 
-        # Truck (x/y) and dolly (zoom) post-adjustments
         tx += truck_x
         ty += truck_y
         if abs(dolly) > 1e-6:
             eff_zoom = max(1e-6, eff_zoom * (2.0 ** dolly))
 
-        # Optional camera shake
-        shake = float(params.get("shake_strength", 0.0))
+        shake = float(params.get("shake_strength", 0.0) or 0.0)
         if shake > 1e-6:
             r = _rng(params.get("shake_seed"))
             tx += (r.random() - 0.5) * 2.0 * shake
@@ -637,39 +714,39 @@ class CameraPipeline(BaseBlock):
         cam = _compose_affine(cam, scale=eff_zoom, rot_deg=rotation, trans=(tx, ty), center=(W / 2, H / 2))
 
         # -------------------- Lens distortion (radial) --------------------
-        k1 = float(params.get("lens_k1", 0.0))
-        k2 = float(params.get("lens_k2", 0.0))
-        if abs(k1) > 0 or abs(k2) > 0:
+        k1 = float(params.get("lens_k1", 0.0) or 0.0)
+        k2 = float(params.get("lens_k2", 0.0) or 0.0)
+        if abs(k1) > 1e-6 or abs(k2) > 1e-6:
             cam = _lens_distort(cam, k1, k2, (W * 0.5, H * 0.5))
 
-        # Composite over background (if any alpha)
+        # Composite over background
         out = canvas.copy()
         out.alpha_composite(cam)
 
         # -------------------- Post optics --------------------
-        out = _vignette(out, float(params.get("vignette", 0.0)))
+        out = _vignette(out, float(params.get("vignette", 0.0) or 0.0))
         out = _chroma_ab(
             out,
-            float(params.get("chroma_shift_x_px", params.get("chroma_shift_px", 0.0))),
-            float(params.get("chroma_shift_y_px", 0.0)),
+            float(params.get("chroma_shift_x_px", params.get("chroma_shift_px", 0.0)) or 0.0),
+            float(params.get("chroma_shift_y_px", 0.0) or 0.0),
         )
         out = _bloom(
             out,
-            threshold=_clamp(float(params.get("bloom_threshold", 0.85)), 0.0, 1.0),
-            radius=max(0.0, float(params.get("bloom_radius", 8.0))),
-            intensity=max(0.0, float(params.get("bloom_intensity", 0.0))),
+            threshold=_clamp(float(params.get("bloom_threshold", 0.85) or 0.85), 0.0, 1.0),
+            radius=max(0.0, float(params.get("bloom_radius", 8.0) or 8.0)),
+            intensity=max(0.0, float(params.get("bloom_intensity", 0.0) or 0.0)),
         )
 
-        # -------------------- Tilt‑shift DOF --------------------
+        # -------------------- Tilt-shift DOF --------------------
         out = _tilt_shift(
             out,
-            band_y=_clamp(float(params.get("tiltshift_center_y", 0.5)), 0, 1),
-            band_h=_clamp(float(params.get("tiltshift_band_h", 0.0)), 0, 1),
-            blur_radius=max(0.0, float(params.get("tiltshift_blur_radius", 0.0))),
+            band_y=_clamp(float(params.get("tiltshift_center_y", 0.5) or 0.5), 0, 1),
+            band_h=_clamp(float(params.get("tiltshift_band_h", 0.0) or 0.0), 0, 1),
+            blur_radius=max(0.0, float(params.get("tiltshift_blur_radius", 0.0) or 0.0)),
         )
 
         # -------------------- Tone/grade --------------------
-        wb_str = str(params.get("white_balance", "1,1,1")).split(",")
+        wb_str = str(params.get("white_balance", "1,1,1") or "1,1,1").split(",")
         try:
             wb = (float(wb_str[0]), float(wb_str[1]), float(wb_str[2]))
         except Exception:
@@ -677,25 +754,26 @@ class CameraPipeline(BaseBlock):
 
         out = _tone_map(
             out,
-            exposure=float(params.get("exposure", 0.0)),
-            contrast=float(params.get("contrast", 0.0)),
+            exposure=float(params.get("exposure", 0.0) or 0.0),
+            contrast=float(params.get("contrast", 0.0) or 0.0),
             wb=wb,
-            lift=float(params.get("lift", 0.0)),
-            gamma=max(1e-3, float(params.get("gamma", 1.0))),
-            gain=max(1e-3, float(params.get("gain", 1.0))),
+            lift=float(params.get("lift", 0.0) or 0.0),
+            gamma=max(1e-3, float(params.get("gamma", 1.0) or 1.0)),
+            gain=max(1e-3, float(params.get("gain", 1.0) or 1.0)),
         )
 
         # -------------------- Film grain + rolling shutter --------------------
-        out = _grain(out, float(params.get("grain", params.get("film_grain", 0.0))), params.get("grain_seed"))
-        out = _rolling_shutter(out, float(params.get("rolling_shutter", 0.0)))
+        out = _grain(out, float(params.get("grain", params.get("film_grain", 0.0)) or 0.0), params.get("grain_seed"))
+        out = _rolling_shutter(out, float(params.get("rolling_shutter", 0.0) or 0.0))
 
         # -------------------- Anamorphic + Letterbox --------------------
-        anam = max(0.01, float(params.get("anamorphic_ratio", 1.0)))
+        anam = max(0.01, float(params.get("anamorphic_ratio", 1.0) or 1.0))
         if abs(anam - 1.0) > 1e-3:
             new_h = int(round(H / anam))
             tmp = out.resize((W, max(1, new_h)), Image.Resampling.LANCZOS)
             out = tmp.resize((W, H), Image.Resampling.LANCZOS)
-        aspect = float(params.get("letterbox_aspect", 0.0))
+
+        aspect = float(params.get("letterbox_aspect", 0.0) or 0.0)
         if aspect > 0:
             lb_col = _parse_color(params.get("letterbox_color", "#000000"), (0, 0, 0, 255)) or (0, 0, 0, 255)
             out = _letterbox(out, aspect, lb_col)
@@ -707,6 +785,8 @@ class CameraPipeline(BaseBlock):
             img_post: Optional[Image.Image] = out
             for raw in [s.strip().lower() for s in post.split("|") if s.strip()]:
                 p = local_params.get(raw, {})
+                if not isinstance(p, dict):
+                    p = {}
                 blk = REGISTRY.create(raw)
                 img_post = blk.process(img_post, W, H, params=p)
                 if img_post is None:
@@ -717,5 +797,5 @@ class CameraPipeline(BaseBlock):
 
         return out
 
-# Register block name for the engine
+
 REGISTRY.register("camerapipeline", CameraPipeline)

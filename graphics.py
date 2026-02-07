@@ -6,6 +6,29 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageEnhance
 
+def help(text: str):
+    """
+    Decorator to attach help / description text to a block class.
+    """
+    def decorator(cls):
+        cls.__help__ = text.strip()
+        return cls
+    return decorator
+def params(schema: Dict[str, Any]):
+    """
+    Attach a GUI-friendly parameter schema to a block class.
+
+    Schema format (example):
+      {
+        "radius": {"type": "float", "default": 2.0, "min": 0.0, "max": 50.0, "step": 0.1},
+        "color":  {"type": "color", "default": "white"},
+        "mono":   {"type": "bool",  "default": False},
+      }
+    """
+    def decorator(cls):
+        cls.__params__ = schema
+        return cls
+    return decorator
 # =============== Registry ===============
 class BlockRegistry:
     def __init__(self) -> None:
@@ -24,6 +47,42 @@ class BlockRegistry:
             msg = f"Unknown block '{name}'. Available: {', '.join(self.names()) or '(none)'}"
             raise KeyError(msg)
         return self._by_name[key](**kwargs)
+
+    # ---- NEW: GUI introspection ----
+    def help(self, name: str) -> str:
+        cls = self._by_name.get(name.strip().lower())
+        if not cls:
+            return ""
+        # priority: @help -> docstring
+        h = getattr(cls, "__help__", None)
+        if h:
+            return str(h).strip()
+        return (cls.__doc__ or "").strip()
+
+    def params_schema(self, name: str) -> Dict[str, Any]:
+        cls = self._by_name.get(name.strip().lower())
+        if not cls:
+            return {}
+        return dict(getattr(cls, "__params__", {}) or {})
+
+    def describe(self, name: str) -> Dict[str, Any]:
+        """Convenience for GUI: one call returns everything."""
+        key = name.strip().lower()
+        cls = self._by_name.get(key)
+        if not cls:
+            return {"name": key, "help": "", "params": {}}
+        return {
+            "name": key,
+            "help": self.help(key),
+            "params": self.params_schema(key),
+        }
+
+    def palette(self) -> Dict[str, Dict[str, Any]]:
+        """All blocks for GUI palette/list."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for k in self.names():
+            out[k] = self.describe(k)
+        return out
 
 REGISTRY = BlockRegistry()
 
@@ -134,7 +193,9 @@ def _ensure_image(img: Optional[Image.Image], width: int, height: int) -> Image.
     return img
 
 # =============== Blocks ===============
-
+@params({
+    "color": {"type": "color", "default": "black"},
+})
 @dataclass
 class SolidColor(BaseBlock):
     """Generates a solid color image."""
@@ -142,6 +203,14 @@ class SolidColor(BaseBlock):
         color = _parse_color(params.get("color", "black"), default=(0, 0, 0, 255))
         return Image.new("RGBA", (width, height), color)
 
+@params({
+    "cx": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "cy": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "radius": {"type": "float", "default": 0.2, "min": 0.0, "max": 2.0, "step": 0.01},  # relative to min(w,h)
+    "color": {"type": "color", "default": "white"},
+    "outline": {"type": "color", "default": "none"},
+    "outline_width": {"type": "int", "default": 1, "min": 0, "max": 100, "step": 1},
+})
 @dataclass
 class DrawCircle(BaseBlock):
     """Draws a circle on the image."""
@@ -168,6 +237,10 @@ class DrawCircle(BaseBlock):
         draw.ellipse(bbox, fill=_fill, outline=_outline, width=outline_width)
         return img
 
+@params({
+    "amount": {"type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    "mono": {"type": "bool", "default": False},
+})
 @dataclass
 class AddNoise(BaseBlock):
     """Adds random noise to the image."""
@@ -193,7 +266,11 @@ class AddNoise(BaseBlock):
         # Convert back to PIL Image
         return Image.fromarray((data * 255.0).astype(np.uint8), "RGBA")
 
-
+@params({
+    "start": {"type": "color", "default": "#000000"},
+    "end": {"type": "color", "default": "#FFFFFF"},
+    "angle": {"type": "float", "default": 0.0, "min": -360.0, "max": 360.0, "step": 1.0},
+})
 @dataclass
 class LinearGradient(BaseBlock):
     """
@@ -224,7 +301,13 @@ class LinearGradient(BaseBlock):
         out = (c0[None, None, :] + (c1 - c0)[None, None, :] * t[..., None]).clip(0, 255).astype(np.uint8)
         return Image.fromarray(out, "RGBA")
 
-
+@params({
+    "cx": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "cy": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "radius": {"type": "float", "default": 0.707, "min": 0.001, "max": 4.0, "step": 0.01},
+    "inner": {"type": "color", "default": "#FFFFFF"},
+    "outer": {"type": "color", "default": "#000000"},
+})
 @dataclass
 class RadialGradient(BaseBlock):
     """
@@ -256,7 +339,11 @@ class RadialGradient(BaseBlock):
         out = (c0[None, None, :] + (c1 - c0)[None, None, :] * t[..., None]).clip(0, 255).astype(np.uint8)
         return Image.fromarray(out, "RGBA")
 
-
+@params({
+    "size": {"type": "int", "default": 32, "min": 1, "max": 4096, "step": 1},
+    "color_a": {"type": "color", "default": "#222222"},
+    "color_b": {"type": "color", "default": "#dddddd"},
+})
 @dataclass
 class Checkerboard(BaseBlock):
     """
@@ -278,7 +365,24 @@ class Checkerboard(BaseBlock):
         out = np.where(mask[..., None] == 0, A[None, None, :], B[None, None, :]).astype(np.uint8)
         return Image.fromarray(out, "RGBA")
 
+@params({
+    # normalized
+    "x": {"type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    "y": {"type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    "w": {"type": "float", "default": 0.3, "min": 0.0, "max": 2.0, "step": 0.01},
+    "h": {"type": "float", "default": 0.3, "min": 0.0, "max": 2.0, "step": 0.01},
 
+    # pixel overrides (optional; if present they take priority)
+    "x_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "y_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "w_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "h_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+
+    "fill": {"type": "color", "default": "none"},
+    "outline": {"type": "color", "default": "white"},
+    "outline_width": {"type": "int", "default": 2, "min": 0, "max": 200, "step": 1},
+    "radius": {"type": "int", "default": 0, "min": 0, "max": 2000, "step": 1},
+})
 @dataclass
 class DrawRect(BaseBlock):
     """
@@ -318,7 +422,22 @@ class DrawRect(BaseBlock):
             draw.rectangle(bbox, fill=_fill, outline=_outline, width=ow)
         return img
 
+@params({
+    # normalized
+    "x0": {"type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    "y0": {"type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    "x1": {"type": "float", "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
+    "y1": {"type": "float", "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
 
+    # pixel overrides
+    "x0_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "y0_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "x1_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "y1_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+
+    "width": {"type": "int", "default": 3, "min": 1, "max": 200, "step": 1},
+    "color": {"type": "color", "default": "white"},
+})
 @dataclass
 class DrawLine(BaseBlock):
     """
@@ -345,7 +464,21 @@ class DrawLine(BaseBlock):
             ImageDraw.Draw(img).line([(x0, y0), (x1, y1)], fill=color, width=lw)
         return img
 
-
+@params({
+    "text": {"type": "str", "default": "hello"},
+    "size": {"type": "int", "default": 24, "min": 1, "max": 1000, "step": 1},
+    "fill": {"type": "color", "default": "white"},
+    "anchor": {"type": "enum", "default": "mm", "options": [
+        "lt","lm","lb",
+        "mt","mm","mb",
+        "rt","rm","rb"
+    ]},
+    "font": {"type": "path", "default": None, "nullable": True, "hint": "ttf/otf path"},
+    "x": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "y": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "x_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+    "y_px": {"type": "int", "default": None, "min": 0, "max": 100000, "step": 1, "nullable": True},
+})
 @dataclass
 class DrawText(BaseBlock):
     """
@@ -409,7 +542,9 @@ class DrawText(BaseBlock):
                      print(f"Warning: Could not draw text with fallback anchor: {e_fallback}", file=sys.stderr)
         return img
 
-
+@params({
+    "radius": {"type": "float", "default": 2.0, "min": 0.0, "max": 200.0, "step": 0.1},
+})
 @dataclass
 class GaussianBlur(BaseBlock):
     """Gaussian blur. Params: radius (pixels)"""
@@ -420,7 +555,9 @@ class GaussianBlur(BaseBlock):
             return img.filter(ImageFilter.GaussianBlur(r))
         return img
 
-
+@params({
+    "radius": {"type": "int", "default": 2, "min": 0, "max": 200, "step": 1},
+})
 @dataclass
 class BoxBlur(BaseBlock):
     """Box blur. Params: radius (pixels, rounds down)"""
@@ -431,7 +568,10 @@ class BoxBlur(BaseBlock):
             return img.filter(ImageFilter.BoxBlur(r))
         return img
 
-
+@params({
+    "brightness": {"type": "float", "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01},
+    "contrast": {"type": "float", "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01},
+})
 @dataclass
 class BrightnessContrast(BaseBlock):
     """Adjust brightness/contrast. Params: brightness, contrast (1.0 = no change)"""
@@ -449,7 +589,9 @@ class BrightnessContrast(BaseBlock):
             img = enhancer.enhance(c)
         return img
 
-
+@params({
+    "amount": {"type": "float", "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01},
+})
 @dataclass
 class Saturation(BaseBlock):
     """Adjust color saturation. Params: amount (0=grayscale, 1=no change, >1=boost)"""
@@ -461,7 +603,7 @@ class Saturation(BaseBlock):
             img = enhancer.enhance(s)
         return img
 
-
+@params({})
 @dataclass
 class Invert(BaseBlock):
     """Invert RGB channels, keep alpha."""
@@ -485,7 +627,9 @@ class Invert(BaseBlock):
         out = Image.merge("RGBA", (*rgb_inverted.split(), a))
         return out
 
-
+@params({
+    "gamma": {"type": "float", "default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01},
+})
 @dataclass
 class Gamma(BaseBlock):
     """Apply gamma correction to RGB. Params: gamma (e.g., 0.45 for linear->sRGB approx, 2.2 for sRGB->linear)"""
@@ -522,6 +666,12 @@ class Gamma(BaseBlock):
             return Image.fromarray((arr * 255.0).clip(0,255).astype(np.uint8), img.mode)
 
 
+@params({
+    "strength": {"type": "float", "default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01},
+    "smooth": {"type": "float", "default": 0.8, "min": 0.01, "max": 1.0, "step": 0.01},
+    "cx": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+    "cy": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+})
 @dataclass
 class Vignette(BaseBlock):
     """Radial darkening. Params: strength (0..1), smooth (feather 0..1), cx(0.5), cy(0.5)"""
@@ -560,7 +710,10 @@ class Vignette(BaseBlock):
 
         return Image.fromarray(arr.clip(0, 255).astype(np.uint8), "RGBA")
 
-
+@params({
+    "angle": {"type": "float", "default": 15.0, "min": -360.0, "max": 360.0, "step": 1.0},
+    "expand": {"type": "bool", "default": False},
+})
 @dataclass
 class Rotate(BaseBlock):
     """Rotate image. Params: angle (degrees), expand (bool)"""
@@ -592,6 +745,10 @@ class Rotate(BaseBlock):
             return rotated # Return directly if size didn't change
 
 
+@params({
+    "color": {"type": "color", "default": "black"},
+    "alpha": {"type": "float", "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
+})
 @dataclass
 class BlendColor(BaseBlock):
     """
