@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Any, Tuple
 from urllib.parse import urlparse, unquote
 
@@ -76,20 +78,117 @@ _AUDIO_CACHE_LOCK = threading.Lock()
 _AUDIO_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 # key: (abspath, sr) -> {"sr": int, "x": np.ndarray float32, "dur": float, "path": str}
 
-def _which_ffmpeg() -> str:
-    # If running as a PyInstaller bundle, use the internal temporary path
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+def _ffmpeg_runs(ffmpeg_exe: str) -> bool:
+    try:
+        p = subprocess.run(
+            [ffmpeg_exe, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+            shell=False,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
 
-    # Fallback for when you are just running it in PyCharm
-    return r"C:\Users\natem\PycharmProjects\graphicsProject\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"
+def resolve_ffmpeg_exe(ffmpeg_bin: str | None = None) -> str:
+    """
+    Return an absolute path to a working ffmpeg executable.
+    Checks (in order):
+      1) CLI arg / env override (ffmpeg_bin)
+      2) PyInstaller _MEIPASS
+      3) Near the script / cwd common bundle folders
+      4) PATH via shutil.which
+      5) Known fallback (your current hardcoded path)
+    """
+    candidates: list[str] = []
+
+    # 1) user override (arg or env)
+    if ffmpeg_bin and str(ffmpeg_bin).strip():
+        candidates.append(str(ffmpeg_bin).strip())
+
+    # also respect env if caller passed None
+    env_bin = os.environ.get("FFMPEG_BIN")
+    if env_bin and env_bin.strip() and env_bin.strip() not in candidates:
+        candidates.append(env_bin.strip())
+
+    # 2) PyInstaller bundle
+    if hasattr(sys, "_MEIPASS"):
+        meipass = Path(getattr(sys, "_MEIPASS"))
+        # common pyinstaller patterns
+        candidates += [
+            str(meipass / "ffmpeg.exe"),
+            str(meipass / "ffmpeg" / "ffmpeg.exe"),
+            str(meipass / "bin" / "ffmpeg.exe"),
+        ]
+
+    # 3) common local bundle locations (script dir + cwd)
+    script_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    cwd = Path.cwd()
+    for base in (script_dir, cwd):
+        candidates += [
+            str(base / "ffmpeg.exe"),
+            str(base / "ffmpeg" / "ffmpeg.exe"),
+            str(base / "ffmpeg" / "bin" / "ffmpeg.exe"),
+            str(base / "bin" / "ffmpeg.exe"),
+            str(base / "third_party" / "ffmpeg" / "bin" / "ffmpeg.exe"),
+            str(base / "vendor" / "ffmpeg" / "bin" / "ffmpeg.exe"),
+        ]
+
+    # 4) PATH
+    w = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+    if w:
+        candidates.append(w)
+
+    # 5) your existing hardcoded fallback
+    candidates.append(r"C:\Users\natem\PycharmProjects\graphicsProject\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe")
+
+    # Normalize + test
+    seen: set[str] = set()
+    for c in candidates:
+        if not c:
+            continue
+
+        # If user gave just "ffmpeg" or "ffmpeg.exe", expand via which first
+        if c.lower() in ("ffmpeg", "ffmpeg.exe"):
+            w2 = shutil.which(c)
+            if w2:
+                c = w2
+
+        p = Path(c)
+
+        # If it's a directory, assume it contains ffmpeg(.exe)
+        if p.exists() and p.is_dir():
+            p = p / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+
+        # If it's relative, try absolute
+        try:
+            p_abs = p.resolve()
+        except Exception:
+            p_abs = p
+
+        key = str(p_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if p_abs.exists() and p_abs.is_file():
+            exe = str(p_abs)
+            if _ffmpeg_runs(exe):
+                return exe
+
+    raise RuntimeError(
+        "ffmpeg executable not found or not runnable. "
+        "Tried: " + " | ".join(list(seen)[:12]) + (" ..." if len(seen) > 12 else "")
+    )
 
 def _decode_audio_ffmpeg(path: str, target_sr: int) -> Tuple[np.ndarray, int]:
     """
     Decode any media file to mono float32 samples via ffmpeg.
     Returns (samples, sample_rate).
     """
-    ffmpeg = _which_ffmpeg()
+    ffmpeg = resolve_ffmpeg_exe()
     cmd = [
         ffmpeg,
         "-hide_banner",

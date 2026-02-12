@@ -11,16 +11,16 @@ import os # Added for path checks in font loading
 from typing import Dict, Any, List, Type, Optional
 
 from PIL import Image, ImageDraw
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QCoreApplication
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QCoreApplication, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QPushButton, QComboBox, QLabel, QLineEdit,
     QColorDialog, QSplitter, QGroupBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QSlider, QFileDialog,
-    QProgressDialog, QMessageBox
+    QProgressDialog, QMessageBox,
 )
-
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 # Import all block modules BEFORE GUI boots (they register into registries)
 # These imports ensure your blocks are registered with GFX_REGISTRY and ANIMATION_REGISTRY
 from animations import ANIMATION_REGISTRY, AnimationContext
@@ -620,7 +620,12 @@ class GraphicsGUI(QMainWindow):
         self.blocks: List[BlockControl] = []
 
         self.init_ui()
+        self.audio_output = QAudioOutput()
+        self.audio_player = QMediaPlayer()
+        self.audio_player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(0.75)  # 0.0 to 1.0
 
+        self._current_audio_path: str | None = None
         # Timer for live preview updates
         self.timer = QTimer()
         self.timer.timeout.connect(self._on_timer_tick)
@@ -760,7 +765,65 @@ class GraphicsGUI(QMainWindow):
         self._update_time_slider_position()
         self._update_time_label()
         self.update_preview() # Render initial frame
+    def _get_preview_audio_path(self) -> str | None:
+        """Infer the audio file from the current pipeline (same as export)."""
+        if not self.blocks:
+            return None
+        pipeline_names = [b.block_name for b in self.blocks]
+        extras_list = [b.get_stage_extras() for b in self.blocks]
+        p = _find_visualizer_audio_path(pipeline_names, extras_list)
+        if p and os.path.exists(p):
+            return p
+        return None
 
+    def _ensure_audio_loaded(self):
+        """Load (or clear) audio based on current pipeline."""
+        p = self._get_preview_audio_path()
+        if p == self._current_audio_path:
+            return
+
+        self._current_audio_path = p
+
+        # stop any existing audio
+        try:
+            self.audio_player.stop()
+        except Exception:
+            pass
+
+        if not p:
+            self.audio_player.setSource(QUrl())  # clear source
+            return
+
+        self.audio_player.setSource(QUrl.fromLocalFile(p))
+
+    def _audio_seek_to_current_time(self):
+        """Seek audio player to self._current_time."""
+        if not self._current_audio_path:
+            return
+        ms = int(max(0.0, self._current_time) * 1000.0)
+        # Only seek if we’re meaningfully out of sync (prevents spam-seeking)
+        if abs(self.audio_player.position() - ms) > 80:
+            self.audio_player.setPosition(ms)
+
+    def _audio_play(self):
+        """Start audio in sync with current time."""
+        self._ensure_audio_loaded()
+        if not self._current_audio_path:
+            return
+        self._audio_seek_to_current_time()
+        self.audio_player.play()
+
+    def _audio_pause(self):
+        try:
+            self.audio_player.pause()
+        except Exception:
+            pass
+
+    def _audio_stop(self):
+        try:
+            self.audio_player.stop()
+        except Exception:
+            pass
     def _update_time_slider_range(self):
         total_frames = int(round(self._animation_duration * self._animation_fps))
         self.time_slider.blockSignals(True)
@@ -780,25 +843,49 @@ class GraphicsGUI(QMainWindow):
         self.time_label.setText(f"Time: {self._current_time:.2f}s (Frame {current_frame})")
 
     def _on_timer_tick(self):
-        if self._is_playing:
+        if not self._is_playing:
+            return
+
+        # If audio exists, let audio drive time
+        if self._current_audio_path:
+            pos_ms = self.audio_player.position()
+            self._current_time = max(0.0, pos_ms / 1000.0)
+
+            # Loop behavior: if we reach the animation end, restart both
+            if self._current_time >= self._animation_duration:
+                self._current_time = 0.0
+                self.audio_player.setPosition(0)
+                # keep playing
+        else:
+            # No audio -> old behavior
             self._current_time += (1.0 / self._animation_fps)
             if self._current_time >= self._animation_duration:
-                self._current_time = 0.0 # Loop animation
-            self._update_time_slider_position()
-            self._update_time_label()
-            self.update_preview()
+                self._current_time = 0.0
+
+        self._update_time_slider_position()
+        self._update_time_label()
+        self.update_preview()
 
     def toggle_play_pause(self):
         self._is_playing = not self._is_playing
+
         if self._is_playing:
             self.play_pause_button.setText("⏸ Pause")
-            # If animation reached end, reset to start when playing again
-            if self._current_time >= self._animation_duration - (1.0 / self._animation_fps): # Near end
+
+            # always re-evaluate which audio file is in the pipeline
+            self._ensure_audio_loaded()
+
+            # if near end, reset
+            if self._current_time >= self._animation_duration - (1.0 / self._animation_fps):
                 self._current_time = 0.0
+
+            # start audio synced
+            self._audio_play()
+
             self.timer.start(int(1000 / self._animation_fps))
         else:
             self.play_pause_button.setText("▶ Play")
-            # When paused, ensure preview updates based on current time
+            self._audio_pause()
             self.update_preview()
 
     def pause_animation(self):
@@ -823,10 +910,12 @@ class GraphicsGUI(QMainWindow):
         self.update_preview()
 
     def set_current_frame_from_slider(self, frame_index: int):
-        # This is called when the slider is moved by the user
         self._current_time = frame_index / self._animation_fps
         self._update_time_label()
-        # Preview update is connected to sliderReleased to avoid excessive renders during drag
+
+        # keep audio aligned while scrubbing
+        self._ensure_audio_loaded()
+        self._audio_seek_to_current_time()
 
     def add_block(self):
         name = self.block_combo.currentText().strip().lower()
@@ -909,7 +998,7 @@ class GraphicsGUI(QMainWindow):
 
             pil_img = self.engine.render_frame(pipeline=pipeline, extras=extras, ctx=ctx)
             self._display_pil_image(pil_img)
-
+            self._ensure_audio_loaded()
         except Exception:
             # print(traceback.format_exc()) # Uncomment for debugging
             # Display an error image if rendering fails

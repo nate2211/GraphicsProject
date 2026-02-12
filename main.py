@@ -7,6 +7,7 @@ import os
 import sys
 import subprocess # For ffmpeg
 import time # For animation timing
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 import numpy as np
@@ -134,13 +135,110 @@ def _drain_stream(stream):
         pass
 
 
-def _which_ffmpeg() -> str:
-    # If running as a PyInstaller bundle, use the internal temporary path
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+def _ffmpeg_runs(ffmpeg_exe: str) -> bool:
+    try:
+        p = subprocess.run(
+            [ffmpeg_exe, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+            shell=False,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
 
-    # Fallback for when you are just running it in PyCharm
-    return r"C:\Users\natem\PycharmProjects\graphicsProject\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"
+def resolve_ffmpeg_exe(ffmpeg_bin: str | None = None) -> str:
+    """
+    Return an absolute path to a working ffmpeg executable.
+    Checks (in order):
+      1) CLI arg / env override (ffmpeg_bin)
+      2) PyInstaller _MEIPASS
+      3) Near the script / cwd common bundle folders
+      4) PATH via shutil.which
+      5) Known fallback (your current hardcoded path)
+    """
+    candidates: list[str] = []
+
+    # 1) user override (arg or env)
+    if ffmpeg_bin and str(ffmpeg_bin).strip():
+        candidates.append(str(ffmpeg_bin).strip())
+
+    # also respect env if caller passed None
+    env_bin = os.environ.get("FFMPEG_BIN")
+    if env_bin and env_bin.strip() and env_bin.strip() not in candidates:
+        candidates.append(env_bin.strip())
+
+    # 2) PyInstaller bundle
+    if hasattr(sys, "_MEIPASS"):
+        meipass = Path(getattr(sys, "_MEIPASS"))
+        # common pyinstaller patterns
+        candidates += [
+            str(meipass / "ffmpeg.exe"),
+            str(meipass / "ffmpeg" / "ffmpeg.exe"),
+            str(meipass / "bin" / "ffmpeg.exe"),
+        ]
+
+    # 3) common local bundle locations (script dir + cwd)
+    script_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    cwd = Path.cwd()
+    for base in (script_dir, cwd):
+        candidates += [
+            str(base / "ffmpeg.exe"),
+            str(base / "ffmpeg" / "ffmpeg.exe"),
+            str(base / "ffmpeg" / "bin" / "ffmpeg.exe"),
+            str(base / "bin" / "ffmpeg.exe"),
+            str(base / "third_party" / "ffmpeg" / "bin" / "ffmpeg.exe"),
+            str(base / "vendor" / "ffmpeg" / "bin" / "ffmpeg.exe"),
+        ]
+
+    # 4) PATH
+    w = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+    if w:
+        candidates.append(w)
+
+    # 5) your existing hardcoded fallback
+    candidates.append(r"C:\Users\natem\PycharmProjects\graphicsProject\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe")
+
+    # Normalize + test
+    seen: set[str] = set()
+    for c in candidates:
+        if not c:
+            continue
+
+        # If user gave just "ffmpeg" or "ffmpeg.exe", expand via which first
+        if c.lower() in ("ffmpeg", "ffmpeg.exe"):
+            w2 = shutil.which(c)
+            if w2:
+                c = w2
+
+        p = Path(c)
+
+        # If it's a directory, assume it contains ffmpeg(.exe)
+        if p.exists() and p.is_dir():
+            p = p / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+
+        # If it's relative, try absolute
+        try:
+            p_abs = p.resolve()
+        except Exception:
+            p_abs = p
+
+        key = str(p_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if p_abs.exists() and p_abs.is_file():
+            exe = str(p_abs)
+            if _ffmpeg_runs(exe):
+                return exe
+
+    raise RuntimeError(
+        "ffmpeg executable not found or not runnable. "
+        "Tried: " + " | ".join(list(seen)[:12]) + (" ..." if len(seen) > 12 else "")
+    )
 def start_ffmpeg_process(
     outfile: str,
     width: int,
@@ -151,7 +249,7 @@ def start_ffmpeg_process(
     duration: float | None = None,      # optional: clamp to your animation length
     loop_audio: bool = True,           # optional: loop audio to fill duration
 ) -> subprocess.Popen:
-    bin_path = _which_ffmpeg()
+    bin_path = resolve_ffmpeg_exe(ffmpeg_bin)
 
     command = [
         bin_path,
@@ -173,24 +271,13 @@ def start_ffmpeg_process(
 
     has_audio = bool(audio_path)
 
-    # ----- AUDIO INPUT (optional) -----
     if has_audio:
-        if loop_audio:
-            command += ["-stream_loop", "-1", "-i", audio_path]
-        else:
-            command += ["-i", audio_path]
-        command += [
-            "-i", audio_path,
-        ]
+        if loop_audio and duration is not None and duration > 0:
+            command += ["-stream_loop", "-1"]
+        command += ["-i", audio_path]
 
-        # Explicit mapping: video from input 0, audio from input 1
-        command += [
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-        ]
+        command += ["-map", "0:v:0", "-map", "1:a:0"]
 
-        # If you know the animation duration, clamp output length.
-        # (Helps if audio is longer / looped.)
         if duration is not None and duration > 0:
             command += ["-t", str(float(duration))]
 
@@ -287,36 +374,57 @@ def finish_ffmpeg_process(proc: subprocess.Popen, *, grace_sec: float = 15.0) ->
     return False
 
 def feed_ffmpeg(proc: subprocess.Popen, frame: Image.Image):
-    """Sends a single RGBA frame to ffmpeg's stdin."""
+    if frame.mode != "RGBA":
+        frame = frame.convert("RGBA")
     try:
-        # Ensure frame is RGBA before getting bytes
-        if frame.mode != "RGBA":
-            frame = frame.convert("RGBA")
-        proc.stdin.write(frame.tobytes()) # type: ignore
+        proc.stdin.write(frame.tobytes())  # type: ignore
     except (BrokenPipeError, OSError) as e:
-        print(f"\nError writing to ffmpeg stdin: {e}", file=sys.stderr)
-        print("FFmpeg might have crashed. Check stderr:", file=sys.stderr)
-        stderr = proc.communicate()[1] # Get stderr output
+        stderr = b""
+        try:
+            stderr = proc.communicate(timeout=1)[1] or b""
+        except Exception:
+            pass
         if stderr:
-             print(stderr.decode(errors='ignore'), file=sys.stderr)
-        raise # Re-raise the exception to stop the process
+            print(stderr.decode(errors="ignore"), file=sys.stderr)
+        raise RuntimeError(f"Error writing to ffmpeg stdin: {e}")
 
-def finish_ffmpeg_process(proc: subprocess.Popen) -> bool:
-    """Closes stdin and waits for ffmpeg to finish."""
-    if proc.stdin:
-        proc.stdin.close()
-    retcode = proc.wait(timeout=30) # Wait up to 30s
-    if retcode != 0:
-        print(f"ffmpeg process exited with error code {retcode}.", file=sys.stderr)
-        # stderr might have already been printed in feed_ffmpeg on error
-        stderr = proc.stderr.read() if proc.stderr else b""
+def finish_ffmpeg_process(proc: subprocess.Popen, *, timeout: float = 30.0) -> bool:
+    try:
+        if proc.stdin:
+            try:
+                proc.stdin.flush()
+            except Exception:
+                pass
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            rc = proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False
+
+    if rc != 0:
+        stderr = b""
+        try:
+            stderr = proc.stderr.read() if proc.stderr else b""
+        except Exception:
+            pass
         if stderr:
-            print("FFmpeg stderr:", file=sys.stderr)
-            print(stderr.decode(errors='ignore'), file=sys.stderr)
+            print(stderr.decode(errors="ignore"), file=sys.stderr)
         return False
-    print("ffmpeg finished successfully.", file=sys.stderr)
     return True
-
 # ----------------------------- CLI -----------------------------
 
 def build_parser() -> argparse.ArgumentParser:
