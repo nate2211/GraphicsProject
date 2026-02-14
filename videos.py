@@ -356,6 +356,11 @@ def _load_video(src: Any, fps: int = 24, scale: float = 1.0) -> Dict[str, Any]:
     "blend": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
 
     "loop": {"type": "bool", "default": True, "hint": "loop video when ctx.time exceeds duration"},
+    "time_mode": {
+        "type": "str",
+        "default": "auto",
+        "hint": "auto|realtime|proportional  (auto loops when output > clip)",
+    },
 })
 @dataclass
 class VideoClip(BaseBlock):
@@ -389,18 +394,46 @@ class VideoClip(BaseBlock):
         t = _time_from_ctx(ctx, 0.0)
         ctx_d = _duration_from_ctx(ctx, 0.0)
 
-        if ctx_d > 1e-6:
-            p = max(0.0, min(1.0, t / ctx_d))
-            t_video = p * v_dur
-        else:
+        mode = str(params.get("time_mode", "auto") or "auto").strip().lower()
+
+        # Decide how to map timeline time -> video time
+        # - proportional: fit whole clip into output duration (your old behavior)
+        # - realtime: play at natural speed (trim if shorter, loop if longer)
+        # - auto: proportional unless output is longer than clip AND loop=True (then realtime+loop)
+        t_video = t
+
+        if mode == "realtime":
             t_video = t
 
+        elif mode == "proportional":
+            if ctx_d > 1e-6:
+                p = max(0.0, min(1.0, t / ctx_d))
+                t_video = p * v_dur
+            else:
+                t_video = t
+
+        else:  # auto
+            if ctx_d > 1e-6:
+                # If the output is longer than the clip, do NOT stretch the clip—loop it at normal speed.
+                # Add a small epsilon (~1 frame) to avoid float edge cases.
+                eps = 1.0 / float(max(1, v_fps))
+                if loop and v_dur > 1e-6 and ctx_d > (v_dur + eps):
+                    t_video = t  # natural speed, will loop below
+                else:
+                    # otherwise keep your existing "fit clip to output" behavior
+                    p = max(0.0, min(1.0, t / ctx_d))
+                    t_video = p * v_dur
+            else:
+                t_video = t
+
+        # Apply looping/clamping
         if loop and v_dur > 1e-6:
             t_video = t_video % v_dur
         else:
             t_video = max(0.0, min(v_dur, t_video))
 
-        idx = int(round(t_video * v_fps))
+        # Frame index (floor is usually smoother than round for video sampling)
+        idx = int(t_video * v_fps)
         idx = max(0, min(len(frames) - 1, idx))
         im = frames[idx].convert("RGBA")
 
