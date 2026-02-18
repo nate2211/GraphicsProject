@@ -1,5 +1,5 @@
 This project represents a highly modular, high-fidelity generative graphics and animation system. Below is a comprehensive README.md designed for a GitHub repository, incorporating the architecture, features, and setup instructions based on the provided code.
-Nates Graphics Engine
+# Nates Graphics Engine
 <img width="1396" height="923" alt="Screenshot 2026-02-16 221205" src="https://github.com/user-attachments/assets/037a1801-ccac-40cf-84ed-92f080656820" />
 
 A cinematic, modular, and animation-aware 2D/3D generative graphics suite. The Gemini Graphics Engine combines Python's processing power with FFmpeg's video capabilities to create a high-performance "Generative Lab" for static designs, audio visualizers, and complex animations.
